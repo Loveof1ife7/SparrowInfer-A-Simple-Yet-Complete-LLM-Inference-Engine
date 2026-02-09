@@ -1,4 +1,6 @@
-// Naive scaled dot-product attention kernel (O(N^2))
+// src/kernels/fa_naive.cu
+// 这是一个非常基础的实现，主要用于理清Attention的计算流程和CUDA编程模型。它没有使用任何高级优化技术，如共享内存、分块计算、Warp Shuffle等，因此性能较低，但代码结构清晰，易于理解。
+
 // Layout: [B, H, N, D], dtype: fp16 (half)
 
 // scores[t,s] = 1 / sqrt(D) * \sum_d q[t,d] * k[s,d]

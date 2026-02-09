@@ -2,9 +2,11 @@
 
 #include <torch/extension.h>
 
-torch::Tensor flash_attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v);
+torch::Tensor flash_attention_forward_v1(torch::Tensor q, torch::Tensor k, torch::Tensor v);
+torch::Tensor flash_attention_forward_v2(torch::Tensor q, torch::Tensor k, torch::Tensor v);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.def("flash_attention_forward", &flash_attention_forward, "Flash Attention forward (CUDA)");
+    m.def("flash_attention_forward_v1", &flash_attention_forward_v1, "Flash Attention forward v1 (CUDA): tiled implementation");
+    m.def("flash_attention_forward_v2", &flash_attention_forward_v2, "Flash Attention forward v2 (CUDA): tiled implementation with WMMA");
 }

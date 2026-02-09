@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from flashattn import flash_attention_forward 
+from flashattn import flash_attention_forward_v1, flash_attention_forward_v2 
 
 def make_inputs(B=4, H=8, N=128, D=8, dtype=torch.float16, device="cuda"):
     q = torch.randn(B, H, N, D, dtype=dtype, device=device).contiguous()
@@ -127,20 +127,32 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
     # 测试你的CUDA实现
     try:
         output_my, ms_my = bench(
-            lambda a,b,c: flash_attention_forward(a,b,c),
+            lambda a,b,c: flash_attention_forward_v1(a,b,c),
             q, k, v,
             iters=iters,
-            name="My Flash Attention"
+            name="My Flash Attention v1"
         )
     except Exception as e:
-        print(f"❌ 你的CUDA实现失败: {e}")
+        print(f"❌ My Flash Attention v1 实现失败: {e}")   
         output_my = None
         ms_my = float('inf')
+    try:
+        output_my2, ms_my2 = bench(
+            lambda a,b,c: flash_attention_forward_v2(a,b,c),
+            q, k, v,
+            iters=iters,
+            name="My Flash Attention v2"
+        )
+    except Exception as e:
+        print(f"❌ My Flash Attention v2 实现失败: {e}")   
+        output_my2 = None
+        ms_my2 = float('inf')
     
     print(f"\n📈 性能结果:")
     print(f"  Matmul Attention:      {ms_mm:.3f} ms")
     print(f"  Torch SDP Attention:   {ms_sdp:.3f} ms")
-    print(f"  My Flash Attention:    {ms_my:.3f} ms")
+    print(f"  My Flash Attention v1: {ms_my:.3f} ms")
+    print(f"  My Flash Attention v2: {ms_my2:.3f} ms")
     
     if ms_my < float('inf'):
         speedup_vs_mm = ms_mm / ms_my
@@ -148,16 +160,36 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
         print(f"\n🚀 加速比:")
         print(f"  vs Matmul:            {speedup_vs_mm:.2f}x")
         print(f"  vs Torch SDP:         {speedup_vs_sdp:.2f}x")
+    if ms_my2 < float('inf'):
+        speedup_vs_mm2 = ms_mm / ms_my2
+        speedup_vs_sdp2 = ms_sdp / ms_my2
+        print(f"\n🚀 加速比 (v2):")
+        print(f"  vs Matmul:            {speedup_vs_mm2:.2f}x")
+        print(f"  vs Torch SDP:         {speedup_vs_sdp2:.2f}x")
     
     print("\n🔍 误差分析:")
     
     # 以PyTorch SDP为参考标准
-    if output_my is not None:
+    if output_my is not None or output_my2 is not None:
         # 检查与PyTorch SDP的误差
-        errors_my = compute_errors(output_sdp, output_my, "My Kernel vs PyTorch SDP")
+        if output_my is not None:
+            errors_my = compute_errors(output_sdp, output_my, "My Kernel v1 vs PyTorch SDP")
+        else:
+            errors_my = None
+        if output_my2 is not None:
+            errors_my2 = compute_errors(output_sdp, output_my2, "My Kernel v2 vs PyTorch SDP")
+        else:
+            errors_my2 = None
         
         # 检查与朴素实现的误差（作为交叉验证）
-        errors_mm = compute_errors(output_mm, output_my, "My Kernel vs Matmul")
+        if output_my is not None:
+            errors_mm = compute_errors(output_mm, output_my, "My Kernel v1 vs Matmul")
+        else:
+            errors_mm = None
+        if output_my2 is not None:
+            errors_mm2 = compute_errors(output_mm, output_my2, "My Kernel v2 vs Matmul")
+        else:
+            errors_mm2 = None
         
         # 检查PyTorch SDP与朴素实现的误差（参考）
         errors_ref = compute_errors(output_mm, output_sdp, "PyTorch SDP vs Matmul")
@@ -168,27 +200,42 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
         print(f"{'='*60}")
         
         # 性能总结
-        print(f"性能: {ms_my:.3f} ms (PyTorch SDP: {ms_sdp:.3f} ms)")
+        if ms_my < float('inf'):
+            print(f"性能 v1: {ms_my:.3f} ms (PyTorch SDP: {ms_sdp:.3f} ms)")
+        if ms_my2 < float('inf'):
+            print(f"性能 v2: {ms_my2:.3f} ms (PyTorch SDP: {ms_sdp:.3f} ms)")
         
         # 误差总结
-        if errors_my['rel_diff_pct'] < 0.1:  # 0.1% 以内
-            print("✅ 误差: 优秀 (<0.1%)")
-        elif errors_my['rel_diff_pct'] < 1.0:  # 1% 以内
-            print("⚠️  误差: 可接受 (<1%)")
-        elif errors_my['rel_diff_pct'] < 5.0:  # 5% 以内
-            print("⚠️  误差: 较大 (<5%)")
-        else:
-            print("❌ 误差: 过大 (>=5%)")
+        if errors_my:
+            if errors_my['rel_diff_pct'] < 0.1:
+                print("✅ 误差 v1: 优秀 (<0.1%)")
+            elif errors_my['rel_diff_pct'] < 1.0:
+                print("⚠️  误差 v1: 可接受 (<1%)")
+            elif errors_my['rel_diff_pct'] < 5.0:
+                print("⚠️  误差 v1: 较大 (<5%)")
+            else:
+                print("❌ 误差 v1: 过大 (>=5%)")
+        if errors_my2:
+            if errors_my2['rel_diff_pct'] < 0.1:
+                print("✅ 误差 v2: 优秀 (<0.1%)")
+            elif errors_my2['rel_diff_pct'] < 1.0:
+                print("⚠️  误差 v2: 可接受 (<1%)")
+            elif errors_my2['rel_diff_pct'] < 5.0:
+                print("⚠️  误差 v2: 较大 (<5%)")
+            else:
+                print("❌ 误差 v2: 过大 (>=5%)")
         
         # 数值稳定性检查
-        if errors_my['has_nan'] or errors_my['has_inf']:
+        def _ns(err):
+            return err and (err['has_nan'] or err['has_inf'])
+        if _ns(errors_my) or _ns(errors_my2):
             print("❌ 数值稳定性: 存在NaN/Inf")
         else:
             print("✅ 数值稳定性: 良好")
         
         return {
-            'performance': {'my': ms_my, 'sdp': ms_sdp, 'matmul': ms_mm},
-            'errors': {'vs_sdp': errors_my, 'vs_matmul': errors_mm, 'ref': errors_ref}
+            'performance': {'my_v1': ms_my, 'my_v2': ms_my2, 'sdp': ms_sdp, 'matmul': ms_mm},
+            'errors': {'vs_sdp_v1': errors_my, 'vs_sdp_v2': errors_my2, 'vs_matmul_v1': errors_mm, 'vs_matmul_v2': errors_mm2, 'ref': errors_ref}
         }
     else:
         return None
@@ -251,7 +298,7 @@ if __name__ == "__main__":
     parser.add_argument('--H', type=int, default=8, help='Number of heads')
     parser.add_argument('--N', type=int, default=128, help='Sequence length')
     parser.add_argument('--D', type=int, default=64, help='Head dimension')
-    parser.add_argument('--comprehensive', action='store_true', help='运行全面测试')
+    parser.add_argument('--comprehensive', action='store_true', help='Run comprehensive test suite')
     
     args = parser.parse_args()
     

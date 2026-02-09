@@ -8,6 +8,7 @@ def _build_extension():
         os.path.join(this_dir, "flashattn_cuda.cu"),
         os.path.join(this_dir, "kernels", "fa_passthrough.cu"),
         os.path.join(this_dir, "kernels", "fa_tiled.cu"),
+        os.path.join(this_dir, "kernels", "fa_tensor_core.cu")
     ]
     extra_cflags = ["-O3"]
     extra_cuda_cflags = ["-O3", "--use_fast_math", "-lineinfo"]
@@ -28,5 +29,8 @@ def _get_ext():
         _ext = _build_extension()
     return _ext
 
-def flash_attention_forward(q, k, v):
-    return _get_ext().flash_attention_forward(q, k, v)
+def flash_attention_forward_v1(q, k, v):
+    return _get_ext().flash_attention_forward_v1(q, k, v)
+
+def flash_attention_forward_v2(q, k, v):
+    return _get_ext().flash_attention_forward_v2(q, k, v)

@@ -1,3 +1,6 @@
+// src/kernels/fa_tiled.cu
+// 这是一个基于分块 (Tiled) 的实现，利用了共享内存和 Warp Shuffle 技术来优化计算。每个 Block 负责处理一个 (b, h) 的 16 行 Q，并在循环中加载 K 和 V 的片段到共享内存中进行计算。这个版本的性能比 naive 版本更好，但仍然没有使用 Tensor Cores，因此在较大的输入规模下可能仍然不够快。
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -32,7 +35,7 @@ __device__ __forceinline__ int idx(int b, int h, int n, int d, int H, int N, int
 //     Update_Output_Accumulator();
 // }
 
-__global__ void attn_v1_tiled_kernel(
+__global__ void fa_tiled_kernel(
     const half *__restrict__ Q,
     const half *__restrict__ K,
     const half *__restrict__ V,
@@ -161,7 +164,7 @@ __global__ void attn_v1_tiled_kernel(
     }
 }
 
-void launch_attn_v1(const half *q, const half *k, const half *v, half *out,
+void launch_attn_tiled(const half *q, const half *k, const half *v, half *out,
                     int B, int H, int N, int D)
 {
     // 总Block数 = Grid.x × Grid.y = (B × H) × ceil(N / 16)
@@ -175,5 +178,5 @@ void launch_attn_v1(const half *q, const half *k, const half *v, half *out,
     float scale = 1.0f / sqrtf((float)D);
     int shared_mem_size = 0; // Static allocation used
 
-    attn_v1_tiled_kernel<<<grid, block, shared_mem_size>>>(q, k, v, out, B, H, N, D, scale);
+    fa_tiled_kernel<<<grid, block, shared_mem_size>>>(q, k, v, out, B, H, N, D, scale);
 }
