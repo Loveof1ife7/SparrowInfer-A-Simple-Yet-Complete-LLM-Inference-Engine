@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from flashattn import flash_attention_forward_v1, flash_attention_forward_v2 
+from flashattn import flash_attention_forward_v1, flash_attention_forward_v2, flash_attention_forward_v3
 
 def make_inputs(B=4, H=8, N=128, D=8, dtype=torch.float16, device="cuda"):
     q = torch.randn(B, H, N, D, dtype=dtype, device=device).contiguous()
@@ -147,12 +147,24 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
         print(f"❌ My Flash Attention v2 实现失败: {e}")   
         output_my2 = None
         ms_my2 = float('inf')
+    try:
+        output_my3, ms_my3 = bench(
+            lambda a,b,c: flash_attention_forward_v3(a,b,c),
+            q, k, v,
+            iters=iters,
+            name="My Flash Attention v3"
+        )
+    except Exception as e:
+        print(f"❌ My Flash Attention v3 实现失败: {e}")   
+        output_my3 = None
+        ms_my3 = float('inf')
     
     print(f"\n📈 性能结果:")
     print(f"  Matmul Attention:      {ms_mm:.3f} ms")
     print(f"  Torch SDP Attention:   {ms_sdp:.3f} ms")
     print(f"  My Flash Attention v1: {ms_my:.3f} ms")
     print(f"  My Flash Attention v2: {ms_my2:.3f} ms")
+    print(f"  My Flash Attention v3: {ms_my3:.3f} ms")
     
     if ms_my < float('inf'):
         speedup_vs_mm = ms_mm / ms_my
@@ -166,11 +178,17 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
         print(f"\n🚀 加速比 (v2):")
         print(f"  vs Matmul:            {speedup_vs_mm2:.2f}x")
         print(f"  vs Torch SDP:         {speedup_vs_sdp2:.2f}x")
+    if ms_my3 < float('inf'):
+        speedup_vs_mm3 = ms_mm / ms_my3
+        speedup_vs_sdp3 = ms_sdp / ms_my3
+        print(f"\n🚀 加速比 (v3):")
+        print(f"  vs Matmul:            {speedup_vs_mm3:.2f}x")
+        print(f"  vs Torch SDP:         {speedup_vs_sdp3:.2f}x")
     
     print("\n🔍 误差分析:")
     
     # 以PyTorch SDP为参考标准
-    if output_my is not None or output_my2 is not None:
+    if output_my is not None or output_my2 is not None or output_my3 is not None:
         # 检查与PyTorch SDP的误差
         if output_my is not None:
             errors_my = compute_errors(output_sdp, output_my, "My Kernel v1 vs PyTorch SDP")
@@ -180,6 +198,10 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
             errors_my2 = compute_errors(output_sdp, output_my2, "My Kernel v2 vs PyTorch SDP")
         else:
             errors_my2 = None
+        if output_my3 is not None:
+            errors_my3 = compute_errors(output_sdp, output_my3, "My Kernel v3 vs PyTorch SDP")
+        else:
+            errors_my3 = None
         
         # 检查与朴素实现的误差（作为交叉验证）
         if output_my is not None:
@@ -190,6 +212,10 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
             errors_mm2 = compute_errors(output_mm, output_my2, "My Kernel v2 vs Matmul")
         else:
             errors_mm2 = None
+        if output_my3 is not None:
+            errors_mm3 = compute_errors(output_mm, output_my3, "My Kernel v3 vs Matmul")
+        else:
+            errors_mm3 = None
         
         # 检查PyTorch SDP与朴素实现的误差（参考）
         errors_ref = compute_errors(output_mm, output_sdp, "PyTorch SDP vs Matmul")
@@ -204,6 +230,8 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
             print(f"性能 v1: {ms_my:.3f} ms (PyTorch SDP: {ms_sdp:.3f} ms)")
         if ms_my2 < float('inf'):
             print(f"性能 v2: {ms_my2:.3f} ms (PyTorch SDP: {ms_sdp:.3f} ms)")
+        if ms_my3 < float('inf'):
+            print(f"性能 v3: {ms_my3:.3f} ms (PyTorch SDP: {ms_sdp:.3f} ms)")
         
         # 误差总结
         if errors_my:
@@ -224,18 +252,27 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
                 print("⚠️  误差 v2: 较大 (<5%)")
             else:
                 print("❌ 误差 v2: 过大 (>=5%)")
+        if errors_my3:
+            if errors_my3['rel_diff_pct'] < 0.1:
+                print("✅ 误差 v3: 优秀 (<0.1%)")
+            elif errors_my3['rel_diff_pct'] < 1.0:
+                print("⚠️  误差 v3: 可接受 (<1%)")
+            elif errors_my3['rel_diff_pct'] < 5.0:
+                print("⚠️  误差 v3: 较大 (<5%)")
+            else:
+                print("❌ 误差 v3: 过大 (>=5%)")
         
         # 数值稳定性检查
         def _ns(err):
             return err and (err['has_nan'] or err['has_inf'])
-        if _ns(errors_my) or _ns(errors_my2):
+        if _ns(errors_my) or _ns(errors_my2) or _ns(errors_my3):
             print("❌ 数值稳定性: 存在NaN/Inf")
         else:
             print("✅ 数值稳定性: 良好")
         
         return {
-            'performance': {'my_v1': ms_my, 'my_v2': ms_my2, 'sdp': ms_sdp, 'matmul': ms_mm},
-            'errors': {'vs_sdp_v1': errors_my, 'vs_sdp_v2': errors_my2, 'vs_matmul_v1': errors_mm, 'vs_matmul_v2': errors_mm2, 'ref': errors_ref}
+            'performance': {'my_v1': ms_my, 'my_v2': ms_my2, 'my_v3': ms_my3, 'sdp': ms_sdp, 'matmul': ms_mm},
+            'errors': {'vs_sdp_v1': errors_my, 'vs_sdp_v2': errors_my2, 'vs_sdp_v3': errors_my3, 'vs_matmul_v1': errors_mm, 'vs_matmul_v2': errors_mm2, 'vs_matmul_v3': errors_mm3, 'ref': errors_ref}
         }
     else:
         return None

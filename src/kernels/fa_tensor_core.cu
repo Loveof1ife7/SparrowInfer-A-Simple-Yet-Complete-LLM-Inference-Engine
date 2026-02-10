@@ -86,7 +86,6 @@ __global__ void fa_tensor_core_kernel(
     float m_i = -1e20f;
     float l_i = 0.0f;
 
-    __syncthreads();
     for (int i = 0; i < 4; i++)
         wmma::fill_fragment(frag_O[i], 0.0f);
 
@@ -129,6 +128,7 @@ __global__ void fa_tensor_core_kernel(
         if (tid < 16)
             S_O[r][64 + tid] = 0.0f;
     }
+    __syncthreads();
 
     for (int j = 0; j < N; j += TC)
     {
