@@ -192,8 +192,8 @@ def scan_min_fail(dtype=torch.float16, seed=42, device="cuda"):
 
 def main():
     parser = argparse.ArgumentParser("debug v4")
-    parser.add_argument("--B", type=int, default=1)
-    parser.add_argument("--H", type=int, default=1)
+    parser.add_argument("--B", type=int, default=8)
+    parser.add_argument("--H", type=int, default=16)
     parser.add_argument("--N", type=int, default=128)
     parser.add_argument("--D", type=int, default=64)
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"])

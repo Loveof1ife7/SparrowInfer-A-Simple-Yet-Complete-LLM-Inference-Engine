@@ -250,9 +250,7 @@ __global__ void fa_kernel_64x64(
 
         // Correct previous O, Frag_O分散在寄存器，无法与S_corr对齐，用 Shared Memory 中转 S_O
         for (int i = 0; i < 4; ++i)
-        {
             wmma::store_matrix_sync(&S_O[warp_row_offset][i * 16], frag_O[i], SMEM_STRIDE, wmma::mem_row_major);
-        }
         __syncthreads();
 
         // S_O = S_O * S_corr + P_TILE * V_TILE
@@ -299,9 +297,7 @@ __global__ void fa_kernel_64x64(
 
         //  Load S_O into fragment (already scaled), accumulate, store back.
         for (int i = 0; i < 4; ++i)
-        {
             wmma::load_matrix_sync(frag_O[i], &S_O[warp_row_offset][i * 16], SMEM_STRIDE, wmma::mem_row_major);
-        }
 
         // 外层循环：沿着“序列长度 (TC)”方向走
         // 我们要把 P 的一行和 V 的一列做点积。这需要把序列长度维度的 64 个数都乘起来加在一起。
@@ -325,14 +321,13 @@ __global__ void fa_kernel_64x64(
                 wmma::mma_sync(frag_O[sub_col], frag_P[k_chunk], frag_V[sub_col], frag_O[sub_col]);
             }
         }
+        __syncthreads();
     }
 
     // ================= Final Store =================
     // Store frag_O -> S_O
     for (int i = 0; i < 4; ++i)
-    {
         wmma::store_matrix_sync(&S_O[warp_row_offset][i * 16], frag_O[i], SMEM_STRIDE, wmma::mem_row_major);
-    }
     __syncthreads();
 
     // Normalize and Write to Global

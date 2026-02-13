@@ -356,8 +356,8 @@ def run_comprehensive_test():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='测试Flash Attention实现')
-    parser.add_argument("--B", type=int, default=1)
-    parser.add_argument("--H", type=int, default=1)
+    parser.add_argument("--B", type=int, default=16)
+    parser.add_argument("--H", type=int, default=16)
     parser.add_argument("--N", type=int, default=128)
     parser.add_argument("--D", type=int, default=64)
     parser.add_argument('--comprehensive', action='store_true', help='Run comprehensive test suite')
