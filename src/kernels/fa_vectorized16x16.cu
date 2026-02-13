@@ -21,6 +21,7 @@ using namespace nvcuda;
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
+
 __device__ __forceinline__ int idx4(
     int b, int h, int n, int d,
     int batch_size, int num_heads, int seq_len)
@@ -54,7 +55,7 @@ __device__ __forceinline__ void load_tile_vectorized_16x64(
     int tid                        // 0..31
 )
 {
-    // 本实现假设 D==64（你现在就是 64）。如果未来要支持别的 D，需要分支处理。
+    // 本实现假设 D==64。如果未来要支持别的 D，需要分支处理。
     // 每行 64 half = 128B = 8 个 vec16（每 vec16=16B => 8*16=128B）
     constexpr int VEC_BYTES = 16;
     constexpr int HALF_PER_VEC = VEC_BYTES / sizeof(half); // 8 half
@@ -133,7 +134,6 @@ __global__ void fa_tensor_core_vectorized_kernel(
     const half *Q_ptr = Q + batch_head_offset;
     const half *K_ptr = K + batch_head_offset;
     const half *V_ptr = V + batch_head_offset;
-    half *O_ptr = out + batch_head_offset;
 
     __shared__ half S_Q[TR][SMEM_STRIDE];
     __shared__ half S_K[TC][SMEM_STRIDE];
