@@ -8,8 +8,7 @@ from flashattn import (
     flash_attention_forward_v1, 
     flash_attention_forward_v2, 
     flash_attention_forward_v3, 
-    flash_attention_forward_v4,
-    flash_attention_forward_v5
+    flash_attention_forward_v4
 )
 
 def make_inputs(B=4, H=8, N=128, D=8, dtype=torch.float16, device="cuda"):

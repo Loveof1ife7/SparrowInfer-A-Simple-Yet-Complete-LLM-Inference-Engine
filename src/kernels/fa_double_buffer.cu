@@ -1,35 +1,3 @@
-//! 阶段式GPU编程
-// Load K/V
-// Sync
-// Compute QK
-// Sync
-// Softmax
-// Sync
-// PV
-// Sync
-// 时间轴 ->
-// [搬运 Load] [等待 Wait] [计算 Compute] [搬运 Load] [等待 Wait] [计算 Compute] ...
-//    (GPU闲)     (GPU闲)       (搬运闲)      (GPU闲)     (GPU闲)       (搬运闲)
-
-//! a) 双缓冲优化
-// Stage-based Pipeline + Double Buffer + cp.async
-// while (running):
-//     prefetch next tile (async)
-//     compute current tile
-//     overlap memory + compute
-
-// 时间轴 ->
-// [序幕 Load Buf 0] [Wait<0>]
-// Loop 开始:
-//    |---- 发出 Load Buf 1 (后台) ---->|
-//    [计算 Compute Buf 0 .............]
-//    (切换身份: Buf 1 变 Compute, Buf 0 变 Load)
-//    |---- 发出 Load Buf 0 (后台) ---->|
-//    [计算 Compute Buf 1 .............]
-
-//! b) 内存优化
-// LDG:  Global Memory -> L1 Cache -> Register (寄存器) -> Shared Memory.
-// 异步 Load (cp.async): Global Memory -> L1 Cache -> Shared Memory
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -39,33 +7,22 @@
 using namespace nvcuda;
 
 // ================= Config =================
-// 1. 增大 Tile Size 到 64
 #define TR 64
 #define TC 64
 #define D_MODEL 64
-
-// 2. 增大 Block Size
 #define BLOCK_DIM 128
-#define WARPS_PER_BLOCK 4
+#define SMEM_STRIDE (D_MODEL + 8) // Padding for bank conflict
 
-// 3. Shared Memory Stride (64 + 8)
-// 加上 padding 避免 Bank Conflict.
-#define SMEM_STRIDE (D_MODEL + 8)
-
-// WMMA Setting
+// WMMA Shapes
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
 
 using vec16 = uint4; // 16 bytes = 8 halfs
 
-__device__ __forceinline__ int idx4(int b, int h, int n, int d, int H, int N)
-{
-    return ((b * H + h) * N + n) * D_MODEL + d;
-}
-// 辅助函数：半个 Warp (16 threads) 内的 Max 归约
-// 为什么从 8 开始？因为只需要 16 个人通信。
-// 如果 offset=16，Lane 0 就会读到 Lane 16 的数据（那是另一行的数据！会出错！）
+// ================= Helper Functions =================
+
+// 1. Warp Reduce Max (Group size = 16)
 __device__ __forceinline__ float half_warp_reduce_max(float val)
 {
 #pragma unroll
@@ -74,7 +31,7 @@ __device__ __forceinline__ float half_warp_reduce_max(float val)
     return val;
 }
 
-// 辅助函数：半个 Warp (16 threads) 内的 Sum 归约
+// 2. Warp Reduce Sum (Group size = 16)
 __device__ __forceinline__ float half_warp_reduce_sum(float val)
 {
 #pragma unroll
@@ -82,78 +39,71 @@ __device__ __forceinline__ float half_warp_reduce_sum(float val)
         val += __shfl_down_sync(0xffffffff, val, offset);
     return val;
 }
-//* Helper function: Asynchronous Copy Wrapper
-//* 1.发起异步搬运: Global -> Shared (16 Bytes = 8 halfs)
+
+// 3. Async Copy (Global -> Shared) 16 Bytes
 __device__ __forceinline__ void cp_async4(void *smem_ptr, const void *gmem_ptr)
 {
+    // 将指针转换为 shared memory 的 32 位整数偏移量
+    unsigned int smem_int = __cvta_generic_to_shared(smem_ptr);
     asm volatile(
-        "cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"(__cvta_generic_to_shared(smem_ptr)), "l"(gmem_ptr));
+        "cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"(smem_int), "l"(gmem_ptr));
 }
-
-//* 2.提交批次: 把刚才发起的搬运打个包
+// 4. Async Copy Commit
 __device__ __forceinline__ void cp_async_commit_group()
 {
     asm volatile("cp.async.commit_group;\n" ::);
 }
 
-//* 3.等待批次: 等待之前发起的搬运完成 (N = 0, 1, 2, 3)
+// 5. Async Copy Wait
 template <int N>
 __device__ __forceinline__ void cp_async_wait_group()
 {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
-//* 4. 通用栅栏: 确保 Shared Memory 可见性
+// 6. Barrier Sync
 __device__ __forceinline__ void barrier_sync()
 {
     asm volatile("bar.sync 0;\n" ::);
 }
 
-//* Loader: Async Version
+// 7. Loader Template
 template <int TILE_SIZE>
 __device__ __forceinline__ void load_tile_async(
-    half (*smem)[SMEM_STRIDE], // 注意：这里传入的是具体的某个 buffer (0 或 1)
+    half (*smem)[SMEM_STRIDE],
     const half *__restrict__ gmem,
     int row_start, int N, int D, int tid)
 {
-    // 任务总量：64行 * 64列 (half)
-    // 字节总量：64 * 64 * 2 bytes = 8192 bytes
-    // 向量总量：8192 / 16 (sizeof vec16) = 512 个 vec16
-    // 线程数：128
-    // 每个线程负责：512 / 128 = 4 个 vec16
     const int total_vecs = TILE_SIZE * (D / 8);
-
 #pragma unroll
-    for (int i = 0; i < 4; ++i) // 每线程4个 vec16
+    for (int i = 0; i < 4; ++i)
     {
         int vec_idx = tid + i * BLOCK_DIM;
         if (vec_idx < total_vecs)
         {
-            // 坐标映射：位运算
-            // 一行有 8 个 vec16 (64 half/ 8 half)
-            // row = vec_idx / 8  -> vec_idx >> 3
-            // col_vec = vec_idx % 8 -> vec_idx & 7
-            // col_half = col_vec * 8 -> col_vec << 3
-
             int r = vec_idx >> 3;
-            int v = vec_idx & 7;
-            int c = v << 3;
+            int c = (vec_idx & 7) << 3;
             int global_r = row_start + r;
+
             void *dst = &smem[r][c];
             const void *src = gmem + global_r * D + c;
+
             if (global_r < N)
             {
-                cp_async4(dst, src); //! [核心修改] 使用 cp.async 发起搬运，不占寄存器，不阻塞
+                cp_async4(dst, src);
             }
             else
             {
-                *reinterpret_cast<uint4 *>(dst) = make_uint4(0, 0, 0, 0); // 边界处理：Padding 0 (cp.async 不能自动填0，需手动填)
+                // Bounds handling: Zero padding manually
+                *reinterpret_cast<uint4 *>(dst) = make_uint4(0, 0, 0, 0);
             }
         }
     }
 }
 
-__global__ void fa_warp_double_buffer(
+// ================= Main Kernel =================
+
+__global__ void fa_warp_double_buffer_kernel(
     const half *__restrict__ Q,
     const half *__restrict__ K,
     const half *__restrict__ V,
@@ -161,120 +111,101 @@ __global__ void fa_warp_double_buffer(
     int B, int H, int N, int D,
     float scale)
 {
-    // ================= Setup Indices =================
+    // --- Index Calculation ---
     int bh = blockIdx.x;
-    int tr_idx = blockIdx.y; // Q 的分块索引
+    int tr_idx = blockIdx.y;
     int b = bh / H;
     int h = bh % H;
     int tid = threadIdx.x;
-
-    // Warp ID: 0, 1, 2, 3
-    // Warp 0: Row 0~15; Warp 1: Row 16~31; Warp 2: Row 32~47; Warp 3: Row 48~63
     int warp_id = tid / 32;
     int lane_id = tid % 32;
 
     int q_row_start = tr_idx * TR;
     int batch_head_offset = (b * H + h) * N * D;
-    half *O_ptr = out + batch_head_offset;
 
-    // 指针偏移
     const half *Q_ptr = Q + batch_head_offset;
     const half *K_ptr = K + batch_head_offset;
     const half *V_ptr = V + batch_head_offset;
+    half *O_ptr = out + batch_head_offset;
 
+    // --- Shared Memory Setup ---
     extern __shared__ char smem_buffer[];
-    // S_Q 不需要双缓冲，因为它在整个 Loop 期间是不变的
+
+    // S_Q: [64][72] (Static, no double buffer)
     half(*S_Q)[SMEM_STRIDE] = (half(*)[SMEM_STRIDE])smem_buffer;
 
-    // S_K 和 S_V 需要双缓冲，变为三维数组 [2][64][72]
+    // S_K, S_V: [2][64][72] (Double Buffered)
+    // 0: Compute Buffer, 1: Load Buffer
     half(*S_K)[TR][SMEM_STRIDE] = (half(*)[TR][SMEM_STRIDE])(S_Q + TR);
-    half(*S_V)[TR][SMEM_STRIDE] = (half(*)[TR][SMEM_STRIDE])(S_K + 2 * TR);
+    half(*S_V)[TR][SMEM_STRIDE] = (half(*)[TR][SMEM_STRIDE])(S_K + 2);
 
-    // 辅助指针
-    // S_S, S_O 还是原来的样子，不需要双缓冲
-    float *ptr_float = (float *)(S_V + TC);
+    // Reuse Memory: After S_K is used for QK^T, we overwrite it with P
+    // S_S: Stores float results of QK^T. Placed after S_V.
+    float *ptr_float = (float *)(S_V + 2);
     float (*S_S)[TC] = (float (*)[TC])ptr_float;
-    float (*S_O)[SMEM_STRIDE] = (float (*)[SMEM_STRIDE])(S_S + TR);
-    // float 缓冲区
-    float *ptr_float = (float *)(S_V + TC);
-    float (*S_S)[TC] = (float (*)[TC])ptr_float;
+
+    // S_O: Accumulator for output.
     float (*S_O)[SMEM_STRIDE] = (float (*)[SMEM_STRIDE])(S_S + TR);
 
-    // 每个 Warp 维护的统计量，不需要 Shared Mem，直接寄存器
-    // 但最后写回 Global 需要 S_L 来做归一化，S_L 放在 Shared 里方便最后统一处理
-    float *S_L = (float *)(S_O + TR); // Size TR
-    float *S_corr = S_L + TR;         // Size TR
+    // Meta stats
+    float *S_L = (float *)(S_O + TR);
+    float *S_corr = S_L + TR;
 
-    // ================= Fragments Definition =================
-    // 每个 Warp 负责 output 的 16 行。
-    // Q: Warp i 需要加载 Q 的 row [16*i : 16*(i+1)]
-    // K: 需要加载完整的 K (所有行)
-    // Q 片段: 只有 1 个 (16x16)，因为 Warp 只负责 Q 的 16 行，且沿着 K 维度(D=64)循环 4 次
+    // --- Fragments ---
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> frag_Q[4];
-    // K 片段: 4 个 (覆盖 64 列)
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> frag_K[4];
-    // V 片段: 4 个 (覆盖 64 列，注意 V 是 row major 加载)
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> frag_V[4];
-    // Accumulators
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> frag_S[4]; // Scores: 16x64 (4 chunks)
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> frag_O[4]; // Output: 16x64 (4 chunks)
-    // P fragment (Softmax 后)
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> frag_S[4];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> frag_O[4];
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> frag_P[4];
 
+    // Init Output Accumulator
     for (int i = 0; i < 4; ++i)
         wmma::fill_fragment(frag_O[i], 0.0f);
 
-    // row全局状态(all tiles)
     float m_i = -1e20f;
     float l_i = 0.0f;
 
+    // --- 1. Load Q (Once) ---
     load_tile_async<TR>(S_Q, Q_ptr, q_row_start, N, D, tid);
     cp_async_commit_group();
-    cp_async_wait_group<0>(); // 必须等 Q 彻底到位
+    cp_async_wait_group<0>(); // Wait strictly
     barrier_sync();
 
-    int warp_row_offset = warp_id * 16; // 每个 Warp 负责 16 行
+    // Load Q to Registers
+    int warp_row_offset = warp_id * 16;
     for (int k = 0; k < 4; ++k)
         wmma::load_matrix_sync(frag_Q[k], &S_Q[warp_row_offset][k * 16], SMEM_STRIDE);
 
-    //* PIPELINE PROLOG
-    // 0. 预加载第一块 (Batch 0) 到 Buffer 0
-    int load_stage = 0;    // 正在加载的 Buffer ID
-    int compute_stage = 0; // 正在计算的 Buffer ID
+    // --- 2. Pipeline Prolog (Load 1st Tile) ---
+    int load_stage = 0;
+    int compute_stage = 0;
 
     load_tile_async<TC>(S_K[load_stage], K_ptr, 0, N, D, tid);
     load_tile_async<TC>(S_V[load_stage], V_ptr, 0, N, D, tid);
-    cp_async_commit_group(); // 提交 Batch 0
+    cp_async_commit_group(); // Commit Batch 0
 
-    //* MAIN LOOP
+    // --- 3. Main Pipeline Loop ---
     for (int j = 0; j < N; j += TC)
     {
-
-        // [流水线步骤 1]: 预取下一块 (如果存在)
-        // 我们在计算当前块 (j) 的同时，加载下一块 (j+TC)
+        // === Stage A: Pre-fetch Next Tile ===
         int next_j = j + TC;
         if (next_j < N)
         {
-            // 切换加载指针到另一个 Buffer (0->1, 1->0)
             int next_load_stage = 1 - load_stage;
-            // 发起 Load K_{j + 1}, V_{j + 1} 到 新的 load_stage_idx
             load_tile_async<TC>(S_K[next_load_stage], K_ptr, next_j, N, D, tid);
             load_tile_async<TC>(S_V[next_load_stage], V_ptr, next_j, N, D, tid);
             cp_async_commit_group();
-            load_stage = next_load_stage; // 更新 load_stage 状态
+            load_stage = next_load_stage;
         }
 
-        // 等待当前块就绪
-        //  我们刚刚提交了下一块的加载请求 (commit)。
-        //  现在流水线上有 2 批货：
-        //  1. 最老的那批 (当前 j): 应该快到了
-        //  2. 最新的那批 (next_j): 刚发出去
-        //  只允许剩下 1 批 (最新的) 在路上。这意味着最老的那批必须送达！
+        // === Stage B: Wait for Current Tile ===
+        // We need the oldest batch (compute_stage) to be ready.
+        // If we prefetched, queue has 2 batches. wait_group<1> ensures oldest is done.
         cp_async_wait_group<1>();
-        barrier_sync(); // 确保所有线程都看到了数据搬运完成
+        barrier_sync(); // Ensure S_K[compute_stage] is visible
 
-        // 计算当前块 (使用 compute_stage)
-        // 此时 compute_stage 指向的数据已经安全落地在 Shared Memory
+        // === Stage C: Compute Q * K^T ===
         for (int i = 0; i < 4; ++i)
             wmma::fill_fragment(frag_S[i], 0.0f);
 
@@ -282,144 +213,195 @@ __global__ void fa_warp_double_buffer(
         {
             for (int sub_col = 0; sub_col < 4; ++sub_col)
             {
-                // 注意：这里读取的是 S_K[compute_stage]
-                const half *k_tile_ptr = &S_K[compute_stage][sub_col * 16][k_chunk * 16];
-                wmma::load_matrix_sync(frag_K[sub_col], k_tile_ptr, SMEM_STRIDE);
+                // Read from S_K[compute_stage]
+                const half *k_ptr = &S_K[compute_stage][sub_col * 16][k_chunk * 16];
+                wmma::load_matrix_sync(frag_K[sub_col], k_ptr, SMEM_STRIDE);
                 wmma::mma_sync(frag_S[sub_col], frag_Q[k_chunk], frag_K[sub_col], frag_S[sub_col]);
             }
         }
 
-        // ... (中间的 Store S -> Softmax -> Correction -> Load P 逻辑保持不变) ...
+        // Store S (float) to Shared Memory for Softmax
         for (int i = 0; i < 4; ++i)
         {
             float *s_ptr = &S_S[warp_row_offset][i * 16];
             wmma::store_matrix_sync(s_ptr, frag_S[i], TC, wmma::mem_row_major);
         }
-        __syncthreads();
+        barrier_sync(); // Wait for S_S write
+
+        // === Stage D: Softmax & Update Acc & Write P ===
+        // 关键：复用 S_K[compute_stage] 作为 S_P 缓冲区
+        half *S_P_buffer = (half *)S_K[compute_stage];
+
+        // Apply Correction to previous O (Reading from S_O, Writing back)
+        // 修正逻辑必须在计算新 P 之前完成，但只需要拿到 Correction 值
+        // 为了避免复杂的依赖，我们在此处计算 Softmax，拿到 correction，立刻修正 S_O
+
+        // Warp-level Softmax Loop
         for (int i = 0; i < 8; i++)
         {
             int row_idx_in_warp = i * 2 + (lane_id / 16);
             int row = warp_row_offset + row_idx_in_warp;
+            int lane_group = lane_id % 16;
 
-            float local_max = -1e20f;
+            // 1. Load S & Local Max
             float val[4];
-
-            int lane_group = lane_id % 16; // 0 ~ 15
-
+            float local_max = -1e20f;
 #pragma unroll
             for (int k = 0; k < 4; ++k)
             {
                 val[k] = S_S[row][lane_group + k * 16] * scale;
                 local_max = fmaxf(local_max, val[k]);
             }
-            // 结果只存在于 Group 的首领线程中 (Lane 0 和 Lane 16)
+
+            // 2. Reduce Max
             float row_max = half_warp_reduce_max(local_max);
-            // 广播 MaxLane 0-15 读取 Lane 0 的值; Lane 16-31 读取 Lane 16 的值
             row_max = __shfl_sync(0xffffffff, row_max, (lane_id / 16) * 16);
 
-            // 更新全局状态 m_i (Running Max)
+            // 3. Update Global Max & Calc Correction
             float m_prev = m_i;
             float m_new = fmaxf(m_prev, row_max);
             float correction = (m_prev <= -1e10f) ? 0.0f : expf(m_prev - m_new);
 
-            if (lane_group == 0) // 每个线程都算出了 correction，但只有 Lane 0 和 16 需要写
+            // 首领更新全局 correction (S_corr 仍需用于修正 S_O)
+            if (lane_group == 0)
                 S_corr[row] = correction;
 
+            // 4. Calc Exp & Local Sum
             float local_sum = 0.0f;
 #pragma unroll
             for (int k = 0; k < 4; ++k)
             {
-                // S_S[row][c] = exp(S_S[row][c] - m_new)
-                // 这里我们直接更新寄存器 val，最后再写回 S_S
                 val[k] = expf(val[k] - m_new);
                 local_sum += val[k];
             }
+
+            // 5. Reduce Sum & Update Global Sum
             float row_sum = half_warp_reduce_sum(local_sum);
             row_sum = __shfl_sync(0xffffffff, row_sum, (lane_id / 16) * 16);
+
             l_i = l_i * correction + row_sum;
             m_i = m_new;
-
-            // 首领线程写回 S_L
             if (lane_group == 0)
                 S_L[row] = l_i;
 
+// 6. [核心复用] Write P (half) directly to S_K[compute_stage]
 #pragma unroll
             for (int k = 0; k < 4; ++k)
             {
-                S_S[row][lane_group + k * 16] = val[k];
+                S_P_buffer[row * SMEM_STRIDE + (lane_group + k * 16)] = __float2half(val[k]);
             }
         }
-        __syncthreads(); // 等待 S_S 被更新为 P，且 S_corr 准备好
 
-        // Correct previous O, Frag_O分散在寄存器，无法与S_corr对齐，用 Shared Memory 中转 S_O
+        barrier_sync(); // 1. S_corr Ready, 2. P (in S_K) Ready
+
+        // === Stage E: Correct S_O ===
+        // 先把之前的 O 修正了，再加新的 PV
         for (int i = 0; i < 4; ++i)
             wmma::store_matrix_sync(&S_O[warp_row_offset][i * 16], frag_O[i], SMEM_STRIDE, wmma::mem_row_major);
-        __syncthreads();
+        barrier_sync();
 
-        // S_O = S_O * S_corr + P_TILE * V_TILE
-        // Scale S_O by correction
-        // tid 0..31 handles 16 rows * 64 cols = 1024 floats. 32 threads, each 32 elems.
         for (int k = 0; k < 32; ++k)
         {
-            int idx = lane_id + k * 32; // 0..1023 floats to process
+            int idx = lane_id + k * 32;
             if (idx < 16 * 64)
             {
-                int r = idx / 64; // local row 0..15
-                int c = idx % 64; // local col 0..63
+                int r = idx / 64;
+                int c = idx % 64;
                 int global_r = warp_row_offset + r;
                 S_O[global_r][c] *= S_corr[global_r];
             }
         }
-        __syncthreads();
+        barrier_sync();
 
-        // Compute P * V and add to S_O
-        // Load P (from S_S buffer which now holds P) -> Half
-        // Convert float P to half P in place or new buffer
-        // S_S is float. WMMA needs half.
-        // Convert S_S to half S_P buffer. (Reuse S_K space)
-        half *S_P_half = (half *)S_K;
-        for (int k = 0; k < 32; ++k) // 32 次才能覆盖 64x64 = 4096 个元素 (128线程 * 32 = 4096)
-        {
-            int idx = tid + k * 128; // 128 threads covering 64*64
-            if (idx < 64 * 64)
-            {
-                int r = idx / 64;
-                int c = idx % 64;
-                S_P_half[r * SMEM_STRIDE + c] = __float2half(S_S[r][c]);
-            }
-        }
-        __syncthreads();
-
-        // Load P fragments (4 chunks along K-dim/Cols of P)
-        for (int k = 0; k < 4; ++k)
-        {
-            // 使用显式的偏移量计算
-            half *tile_ptr = S_P_half + (warp_row_offset * SMEM_STRIDE) + (k * 16);
-            wmma::load_matrix_sync(frag_P[k], tile_ptr, SMEM_STRIDE);
-        }
-
-        //  Load S_O into fragment (already scaled), accumulate, store back.
+        // Reload Corrected O to Registers
         for (int i = 0; i < 4; ++i)
             wmma::load_matrix_sync(frag_O[i], &S_O[warp_row_offset][i * 16], SMEM_STRIDE, wmma::mem_row_major);
 
-        // 外层循环：沿着“序列长度 (TC)”方向走
-        // 我们要把 P 的一行和 V 的一列做点积。这需要把序列长度维度的 64 个数都乘起来加在一起。
-        // O = P * V
+        // === Stage F: Compute O += P * V ===
+        // 此时 S_K[compute] 存的是 P, S_V[compute] 存的是 V
+
+        // Load P fragments (from S_K/P buffer)
+        for (int k = 0; k < 4; ++k)
+        {
+            half *p_tile = S_P_buffer + (warp_row_offset * SMEM_STRIDE) + (k * 16);
+            wmma::load_matrix_sync(frag_P[k], p_tile, SMEM_STRIDE);
+        }
+
+        // MMA Loop
         for (int k_chunk = 0; k_chunk < 4; ++k_chunk)
         {
-            // Load P fragment... (你的代码)
-
             for (int sub_col = 0; sub_col < 4; ++sub_col)
             {
-                // 【关键】读取 S_V[compute_stage]
+                // Read V from S_V[compute_stage]
                 const half *v_ptr = &S_V[compute_stage][k_chunk * 16][sub_col * 16];
                 wmma::load_matrix_sync(frag_V[sub_col], v_ptr, SMEM_STRIDE);
+                // O += P_chunk * V_chunk
                 wmma::mma_sync(frag_O[sub_col], frag_P[k_chunk], frag_V[sub_col], frag_O[sub_col]);
             }
         }
+
+        // === Stage G: Release Buffer ===
+        // 确保本轮所有对 compute_stage buffer 的读取都已完成
+        // 然后才能释放给下一轮作为 load 目标
         barrier_sync();
 
-        // 切换计算指针 (0->1, 1->0)
         compute_stage = 1 - compute_stage;
     }
+
+    // End of Loop: Wait for all async ops
+    cp_async_wait_group<0>();
+    barrier_sync();
+
+    // --- Final Store (Normalize & Write) ---
+    for (int i = 0; i < 4; ++i)
+        wmma::store_matrix_sync(&S_O[warp_row_offset][i * 16], frag_O[i], SMEM_STRIDE, wmma::mem_row_major);
+    barrier_sync();
+
+    const int total_vecs = TR * (D / 8);
+    for (int i = 0; i < 4; ++i)
+    {
+        int vec_idx = tid + i * BLOCK_DIM;
+        if (vec_idx < total_vecs)
+        {
+            int r = vec_idx >> 3;
+            int v = vec_idx & 7;
+            int c = v << 3;
+            int global_r = q_row_start + r;
+
+            if (global_r < N)
+            {
+                float l_val = S_L[r];
+                float inv_l = 1.0f / (l_val + 1e-6f);
+                half result_buf[8];
+                for (int x = 0; x < 8; ++x)
+                    result_buf[x] = __float2half(S_O[r][c + x] * inv_l);
+
+                half *dst = O_ptr + global_r * D + c;
+                *reinterpret_cast<vec16 *>(dst) = *reinterpret_cast<vec16 *>(result_buf);
+            }
+        }
+    }
+}
+
+// Host Launcher
+
+void launch_fa_double_buffer(half *Q, half *K, half *V, half *out, int B, int H, int N, int D)
+{
+    // ✅ 修改 1: 显式计算需要的 SMEM 大小 (给 96KB 安全空间)
+    // 81KB 实际需求，给 96KB 是为了对齐和安全
+    int shared_mem_size = 96 * 1024;
+
+    // ✅ 修改 2: 告诉驱动这个 Kernel 需要更大的 Shared Memory
+    // 默认限制是 48KB，超过必须设置 Attribute
+    cudaFuncSetAttribute(
+        fa_warp_double_buffer_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shared_mem_size);
+
+    dim3 grid(B * H, (N + TR - 1) / TR);
+    dim3 block(BLOCK_DIM);
+
+    // ✅ 修改 3: 传入新的大小
+    fa_warp_double_buffer_kernel<<<grid, block, shared_mem_size>>>(
+        Q, K, V, out, B, H, N, D, 1.0f / sqrtf(D));
 }
