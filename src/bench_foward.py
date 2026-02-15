@@ -4,7 +4,13 @@ import math
 import torch
 import torch.nn.functional as F
 
-from flashattn import flash_attention_forward_v1, flash_attention_forward_v2, flash_attention_forward_v3, flash_attention_forward_v4
+from flashattn import (
+    flash_attention_forward_v1, 
+    flash_attention_forward_v2, 
+    flash_attention_forward_v3, 
+    flash_attention_forward_v4,
+    flash_attention_forward_v5
+)
 
 def make_inputs(B=4, H=8, N=128, D=8, dtype=torch.float16, device="cuda"):
     q = torch.randn(B, H, N, D, dtype=dtype, device=device).contiguous()
@@ -74,23 +80,20 @@ def compute_errors(ref_output, test_output, name="My Kernel"):
     }
 
 @torch.no_grad()
-def bench(fn, q, k, v, iters=100, warmup=10, name="My Kernel"):
+def bench(fn, q, k, v, iters=50, warmup=10, name="Function"):
+    # warmup
     for _ in range(warmup):
         fn(q, k, v)
     torch.cuda.synchronize()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    start.record()
-    out = None
+    t0 = time.time()
     for _ in range(iters):
-        out = fn(q, k, v)
-    end.record()
+        output = fn(q, k, v)
     torch.cuda.synchronize()
-
-    ms = start.elapsed_time(end) / iters
-    return out, ms
+    t1 = time.time()
+    
+    avg_time = (t1 - t0) * 1000 / iters  # ms
+    return output, avg_time
 
 def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
     """运行完整的基准测试和误差分析"""
@@ -174,7 +177,20 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
         print(f"❌ My Flash Attention v4 实现失败: {e}")   
         output_my4 = None
         ms_my4 = float('inf')
-    
+
+    # 测试v5实现
+    try:
+        output_my5, ms_my5 = bench(
+            lambda a,b,c: flash_attention_forward_v5(a,b,c),
+            q, k, v,
+            iters=iters,
+            name="My Flash Attention v5"
+        )
+    except Exception as e:
+        print(f"❌ My Flash Attention v5 实现失败: {e}")   
+        output_my5 = None
+        ms_my5 = float('inf')
+
     print(f"\n📈 性能结果:")
     print(f"  Matmul Attention:      {ms_mm:.3f} ms")
     print(f"  Torch SDP Attention:   {ms_sdp:.3f} ms")
@@ -182,6 +198,7 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
     print(f"  My Flash Attention v2: {ms_my2:.3f} ms")
     print(f"  My Flash Attention v3: {ms_my3:.3f} ms")
     print(f"  My Flash Attention v4: {ms_my4:.3f} ms")
+    print(f"  My Flash Attention v5: {ms_my5:.3f} ms")
     
     if ms_my < float('inf'):
         speedup_vs_mm = ms_mm / ms_my
@@ -207,6 +224,12 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
         print(f"\n🚀 加速比 (v4):")
         print(f"  vs Matmul:            {speedup_vs_mm4:.2f}x")
         print(f"  vs Torch SDP:         {speedup_vs_sdp4:.2f}x")
+    if ms_my5 < float('inf'):
+        speedup_vs_mm5 = ms_mm / ms_my5
+        speedup_vs_sdp5 = ms_sdp / ms_my5
+        print(f"\n🚀 加速比 (v5):")
+        print(f"  vs Matmul:            {speedup_vs_mm5:.2f}x")
+        print(f"  vs Torch SDP:         {speedup_vs_sdp5:.2f}x")
     
     print("\n🔍 误差分析:")
     
@@ -229,6 +252,10 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
             errors_my4 = compute_errors(output_sdp, output_my4, "My Kernel v4 vs PyTorch SDP")
         else:
             errors_my4 = None
+        if output_my5 is not None:
+            errors_my5 = compute_errors(output_sdp, output_my5, "My Kernel v5 vs PyTorch SDP")
+        else:
+            errors_my5 = None
         
         # 检查与朴素实现的误差（作为交叉验证）
         if output_my is not None:
@@ -247,6 +274,10 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
             errors_mm4 = compute_errors(output_mm, output_my4, "My Kernel v4 vs Matmul")
         else:
             errors_mm4 = None
+        if output_my5 is not None:
+            errors_mm5 = compute_errors(output_mm, output_my5, "My Kernel v5 vs Matmul")
+        else:
+            errors_mm5 = None
         
         # 检查PyTorch SDP与朴素实现的误差（参考）
         errors_ref = compute_errors(output_mm, output_sdp, "PyTorch SDP vs Matmul")
@@ -265,6 +296,8 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
             print(f"性能 v3: {ms_my3:.3f} ms (PyTorch SDP: {ms_sdp:.3f} ms)")
         if ms_my4 < float('inf'):
             print(f"性能 v4: {ms_my4:.3f} ms (PyTorch SDP: {ms_sdp:.3f} ms)")
+        if ms_my5 < float('inf'):
+            print(f"性能 v5: {ms_my5:.3f} ms (PyTorch SDP: {ms_sdp:.3f} ms)")
         
         # 误差总结
         def print_error_summary(name, err):
@@ -282,20 +315,24 @@ def run_bench(B=4, H=8, N=128, D=64, dtype=torch.float16, iters=100):
         print_error_summary("v2", errors_my2)
         print_error_summary("v3", errors_my3)
         print_error_summary("v4", errors_my4)
+        print_error_summary("v5", errors_my5)
         
         # 数值稳定性检查
         def _ns(err):
             return err and (err['has_nan'] or err['has_inf'])
-        if _ns(errors_my) or _ns(errors_my2) or _ns(errors_my3) or _ns(errors_my4):
+        if _ns(errors_my) or _ns(errors_my2) or _ns(errors_my3) or _ns(errors_my4) or _ns(errors_my5):
             print("❌ 数值稳定性: 存在NaN/Inf")
         else:
             print("✅ 数值稳定性: 良好")
         
         return {
-            'performance': {'my_v1': ms_my, 'my_v2': ms_my2, 'my_v3': ms_my3, 'my_v4': ms_my4, 'sdp': ms_sdp, 'matmul': ms_mm},
+            'performance': {
+                'my_v1': ms_my, 'my_v2': ms_my2, 'my_v3': ms_my3, 'my_v4': ms_my4, 'my_v5': ms_my5,
+                'sdp': ms_sdp, 'matmul': ms_mm
+            },
             'errors': {
-                'vs_sdp_v1': errors_my, 'vs_sdp_v2': errors_my2, 'vs_sdp_v3': errors_my3, 'vs_sdp_v4': errors_my4,
-                'vs_matmul_v1': errors_mm, 'vs_matmul_v2': errors_mm2, 'vs_matmul_v3': errors_mm3, 'vs_matmul_v4': errors_mm4,
+                'vs_sdp_v1': errors_my, 'vs_sdp_v2': errors_my2, 'vs_sdp_v3': errors_my3, 'vs_sdp_v4': errors_my4, 'vs_sdp_v5': errors_my5,
+                'vs_matmul_v1': errors_mm, 'vs_matmul_v2': errors_mm2, 'vs_matmul_v3': errors_mm3, 'vs_matmul_v4': errors_mm4, 'vs_matmul_v5': errors_mm5,
                 'ref': errors_ref
             }
         }
@@ -356,10 +393,10 @@ def run_comprehensive_test():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='测试Flash Attention实现')
-    parser.add_argument("--B", type=int, default=16)
-    parser.add_argument("--H", type=int, default=16)
-    parser.add_argument("--N", type=int, default=128)
-    parser.add_argument("--D", type=int, default=64)
+    parser.add_argument('--B', type=int, default=16, help='Batch size')
+    parser.add_argument('--H', type=int, default=16, help='Number of heads')
+    parser.add_argument('--N', type=int, default=1024, help='Sequence length')
+    parser.add_argument('--D', type=int, default=64, help='Head dimension')
     parser.add_argument('--comprehensive', action='store_true', help='Run comprehensive test suite')
     
     args = parser.parse_args()

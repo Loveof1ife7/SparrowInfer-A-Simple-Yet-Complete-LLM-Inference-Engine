@@ -5,7 +5,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from flashattn import flash_attention_forward_v4
+from flashattn import flash_attention_forward_v5
 
 
 def set_seed(seed: int):
@@ -65,7 +65,7 @@ def finite_stats(x, name: str):
     return (n_nan == 0 and n_inf == 0)
 
 
-def error_report(ref, out, name="v4"):
+def error_report(ref, out, name=""):
     ref_f = ref.float().cpu()
     out_f = out.float().cpu()
     abs_err = (ref_f - out_f).abs()
@@ -103,7 +103,7 @@ def error_report(ref, out, name="v4"):
 def run_once(B, H, N, D, dtype=torch.float16, seed=42, device="cuda",
              do_sdp=True, do_mm=False, dump_path="debug_dump.pt"):
     print("\n" + "=" * 80)
-    print(f"DEBUG v4 config: B={B}, H={H}, N={N}, D={D}, dtype={dtype}, seed={seed}")
+    print(f"DEBUG  config: B={B}, H={H}, N={N}, D={D}, dtype={dtype}, seed={seed}")
     print("=" * 80)
 
     q, k, v = make_inputs(B, H, N, D, dtype=dtype, device=device, seed=seed)
@@ -130,29 +130,29 @@ def run_once(B, H, N, D, dtype=torch.float16, seed=42, device="cuda",
         torch.cuda.synchronize()
         finite_stats(mm, "matmul_out")
 
-    # v4 输出
+    # v5 输出
     t0 = time.time()
-    out = flash_attention_forward_v4(q, k, v)
+    out = flash_attention_forward_v5(q, k, v)
     torch.cuda.synchronize()
     t1 = time.time()
-    print(f"\n[v4] time: {(t1 - t0) * 1000:.3f} ms (single run)")
+    print(f"\n time: {(t1 - t0) * 1000:.3f} ms (single run)")
 
-    ok = finite_stats(out, "v4_out")
+    ok = finite_stats(out, "v5_out")
 
     # 如果有参考，算误差（即使 out 有 NaN，也会在 float 转换时体现）
     metrics = None
     if ref is not None:
-        metrics = error_report(ref, out, name="v4")
+        metrics = error_report(ref, out, name="v5")
 
     # 如果发现 NaN/Inf：保存可复现 dump
     if not ok:
-        print(f"\n!!! v4 produced NaN/Inf. Saving dump to: {dump_path}")
+        print(f"\n!!! v5 produced NaN/Inf. Saving dump to: {dump_path}")
         payload = {
             "config": {"B": B, "H": H, "N": N, "D": D, "dtype": str(dtype), "seed": seed},
             "q": q.detach().cpu(),
             "k": k.detach().cpu(),
             "v": v.detach().cpu(),
-            "v4_out": out.detach().cpu(),
+            "kernel_out": out.detach().cpu(),
         }
         if ref is not None:
             payload["sdp_out"] = ref.detach().cpu()
@@ -191,7 +191,7 @@ def scan_min_fail(dtype=torch.float16, seed=42, device="cuda"):
 
 
 def main():
-    parser = argparse.ArgumentParser("debug v4")
+    parser = argparse.ArgumentParser("debug ")
     parser.add_argument("--B", type=int, default=8)
     parser.add_argument("--H", type=int, default=16)
     parser.add_argument("--N", type=int, default=128)

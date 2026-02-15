@@ -28,6 +28,9 @@ void launch_fa_vectorized(
 void launch_fa_64x64(
     half *Q, half *K, half *V, half *out, int B, int H, int N, int D);
 
+void launch_fa_warp_shuffle(
+    half *Q, half *K, half *V, half *out, int B, int H, int N, int D);
+
 torch::Tensor flash_attention_forward_v1(
     torch::Tensor q,
     torch::Tensor k,
@@ -109,6 +112,28 @@ torch::Tensor flash_attention_forward_v4(
 
     auto out = torch::empty_like(q);
     launch_fa_64x64(
+        (half *)q.data_ptr<at::Half>(),
+        (half *)k.data_ptr<at::Half>(),
+        (half *)v.data_ptr<at::Half>(),
+        (half *)out.data_ptr<at::Half>(),
+        q.size(0), q.size(1), q.size(2), q.size(3));
+    CUDA_KERNEL_CHECK();
+    return out;
+}
+
+torch::Tensor flash_attention_forward_v5(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v)
+{
+    TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
+    TORCH_CHECK(k.is_cuda() && v.is_cuda(), "k/v must be CUDA");
+    TORCH_CHECK(q.dtype() == k.dtype() && k.dtype() == v.dtype(), "dtype mismatch");
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(), "must be contiguous");
+    TORCH_CHECK(q.dtype() == torch::kHalf, "目前仅支持fp16");
+
+    auto out = torch::empty_like(q);
+    launch_fa_warp_shuffle(
         (half *)q.data_ptr<at::Half>(),
         (half *)k.data_ptr<at::Half>(),
         (half *)v.data_ptr<at::Half>(),
